@@ -6,10 +6,11 @@ import aesara.tensor.random.basic as arb
 import numpy as np
 from aesara.assert_op import Assert
 from aesara.graph.op import Op
+from aesara.tensor.basic import Rebroadcast
 from aesara.tensor.slinalg import Cholesky, solve_lower_triangular
 from aesara.tensor.var import TensorVariable
 
-# from aesara.tensor.xlogx import xlogy0
+from aeppl.abstract import MeasurableVariable
 
 cholesky = Cholesky(lower=True, on_error="nan")
 
@@ -494,3 +495,17 @@ def multinomial_logprob(op, values, *inputs, **kwargs):
         at.all(at.ge(n, 0)),
     )
     return res
+
+
+class MeasurableRebroadcast(Rebroadcast):
+    """A placeholder used to specify a log-likelihood for a Rebroadcast sub-graph."""
+
+
+MeasurableVariable.register(MeasurableRebroadcast)
+
+
+@_logprob.register(MeasurableRebroadcast)
+def rebroadcasted_logprob(op, values, rebroadcasted_var, **kwargs):
+    return _logprob(
+        rebroadcasted_var.owner.op, values, *rebroadcasted_var.owner.inputs, **kwargs
+    )
