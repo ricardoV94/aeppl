@@ -5,7 +5,7 @@ import aesara.tensor as at
 from aesara.compile.mode import optdb
 from aesara.graph.features import Feature
 from aesara.graph.op import compute_test_value
-from aesara.graph.opt import local_optimizer
+from aesara.graph.opt import in2out, local_optimizer
 from aesara.graph.optdb import EquilibriumDB, SequenceDB
 from aesara.tensor.extra_ops import BroadcastTo
 from aesara.tensor.random.op import RandomVariable
@@ -24,6 +24,7 @@ from aesara.tensor.subtensor import (
 )
 from aesara.tensor.var import TensorVariable
 
+from aeppl.transforms import chained_transform_finder
 from aeppl.utils import indices_from_subtensor
 
 inc_subtensor_ops = (IncSubtensor, AdvancedIncSubtensor, AdvancedIncSubtensor1)
@@ -191,6 +192,9 @@ rv_sinking_db.register("broadcast_to_lift", naive_bcast_rv_lift, -5, "basic")
 rv_sinking_db.register("incsubtensor_lift", incsubtensor_rv_replace, -5, "basic")
 
 logprob_rewrites_db.register("sinking", rv_sinking_db, -10, "basic")
+logprob_rewrites_db.register(
+    "chained_transform_finder", in2out(chained_transform_finder), -1, "basic"
+)
 logprob_rewrites_db.register(
     "post-canonicalize", optdb.query("+canonicalize"), 10, "basic"
 )

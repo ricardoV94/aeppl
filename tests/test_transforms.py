@@ -9,12 +9,17 @@ from numdifftools import Jacobian
 from aeppl.joint_logprob import joint_logprob
 from aeppl.transforms import (
     DEFAULT_TRANSFORM,
+    ChainedTransform,
+    ExpTransform,
+    LocTransform,
     LogOddsTransform,
     LogTransform,
     RVTransform,
+    ScaleTransform,
     TransformValuesMapping,
     TransformValuesOpt,
     _default_transformed_rv,
+    _get_single_vars_between_in_out,
 )
 from tests.utils import assert_no_rvs
 
@@ -357,3 +362,401 @@ def test_TransformValuesMapping():
     fg.attach_feature(tvm2)
 
     assert fg._features[-1] is tvm
+
+
+def test_chained_transform():
+    ch = ChainedTransform(
+        transform_list=[
+            ScaleTransform(
+                transform_args_fn=lambda *inputs: inputs[-1],
+                filter_non_rv_inputs_fn=lambda *inputs: inputs[:-1],
+            ),
+            ExpTransform(),
+            LocTransform(
+                transform_args_fn=lambda *inputs: inputs[-1],
+                filter_non_rv_inputs_fn=lambda *inputs: inputs[:-1],
+            ),
+        ],
+        base_op=at.random.multivariate_normal,
+    )
+
+    x = at.random.multivariate_normal(np.zeros(3), np.eye(3))
+    x_val = x.eval()
+
+    scale = 0.1
+    loc = 5
+
+    x_val_forward = ch.forward(x_val, *x.owner.inputs, scale, loc).eval()
+    assert np.allclose(
+        x_val_forward,
+        np.exp(x_val * scale) + loc,
+    )
+
+    x_val_backward = ch.backward(x_val_forward, *x.owner.inputs, scale, loc).eval()
+    assert np.allclose(
+        x_val_backward,
+        x_val,
+    )
+
+    log_jac_det = ch.log_jac_det(x_val_forward, *x.owner.inputs, scale, loc)
+    assert np.isclose(
+        log_jac_det.eval(),
+        -np.log(scale) - np.sum(np.log(x_val_forward - loc)),
+    )
+
+
+@pytest.mark.parametrize(
+    "rv_size, loc_type",
+    [
+        (None, at.scalar),
+        (1, at.TensorType("floatX", (True,))),
+        (2, at.vector),
+        ((3, 2), at.matrix),
+    ],
+)
+def test_loc_transform(rv_size, loc_type):
+
+    loc = loc_type("loc")
+
+    y_rv = loc + at.random.normal(0, 1, size=rv_size, name="base_rv")
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y}, sum=False)
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([loc, y], logp)
+
+    loc_test_val = np.full(rv_size, 4.0)
+    y_test_val = np.full(rv_size, 1.0)
+
+    np.testing.assert_allclose(
+        logp_fn(loc_test_val, y_test_val),
+        sp.stats.norm(loc_test_val, 1).logpdf(y_test_val),
+    )
+
+
+@pytest.mark.parametrize(
+    "rv_size, scale_type",
+    [
+        (None, at.scalar),
+        (1, at.TensorType("floatX", (True,))),
+        (2, at.vector),
+        ((3, 1), at.col),
+    ],
+)
+def test_scale_transform(rv_size, scale_type):
+
+    scale = scale_type("scale")
+
+    y_rv = at.random.normal(0, 1, size=rv_size, name="base_rv") * scale
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y}, sum=False)
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([scale, y], logp)
+
+    scale_test_val = np.full(rv_size, 4.0)
+    y_test_val = np.full(rv_size, 1.0)
+
+    np.testing.assert_allclose(
+        logp_fn(scale_test_val, y_test_val),
+        sp.stats.norm(0, scale_test_val).logpdf(y_test_val),
+    )
+
+
+@pytest.mark.parametrize(
+    "rv_size, scale_type",
+    [
+        (None, at.scalar),
+        (1, at.TensorType("floatX", (True,))),
+        (2, at.vector),
+        ((3, 1), at.col),
+    ],
+)
+def test_affine_transform(rv_size, scale_type):
+    loc = at.scalar("loc")
+    scale = scale_type("scale")
+
+    y_rv = loc + at.random.normal(0, 1, size=rv_size, name="base_rv") * scale
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y}, sum=False)
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([loc, scale, y], logp)
+
+    loc_test_val = 4.0
+    scale_test_val = np.full(rv_size, 0.5)
+    y_test_val = np.full(rv_size, 1.0)
+
+    np.testing.assert_allclose(
+        logp_fn(loc_test_val, scale_test_val, y_test_val),
+        sp.stats.norm(loc_test_val, scale_test_val).logpdf(y_test_val),
+    )
+
+
+def test_double_loc_transform():
+    loc1 = at.scalar("loc1")
+    loc2 = at.scalar("loc2")
+    y_rv = loc1 + loc2 + at.random.normal(0, 1, name="base_rv")
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y})
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([loc1, loc2, y], logp)
+
+    loc1_test_val = 2.0
+    loc2_test_val = 3.0
+    y_test_val = 1.0
+
+    assert np.isclose(
+        logp_fn(loc1_test_val, loc1_test_val, y_test_val),
+        sp.stats.norm(loc1_test_val + loc2_test_val, 1).logpdf(y_test_val),
+    )
+
+
+def test_double_scale_transform():
+    scale1 = at.scalar("scale1")
+    scale2 = at.scalar("scale2")
+    y_rv = at.random.normal(0, 1, name="base_rv") * scale1 * scale2
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y})
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([scale1, scale2, y], logp)
+
+    scale1_test_val = 2.0
+    scale2_test_val = 3.0
+    y_test_val = 1.0
+
+    assert np.isclose(
+        logp_fn(scale1_test_val, scale1_test_val, y_test_val),
+        sp.stats.norm(0, scale1_test_val * scale2_test_val).logpdf(y_test_val),
+    )
+
+
+def test_exp_scale_transform():
+    b = at.scalar("b")
+    base_rv = at.random.normal(0, 1, size=2, name="base_rv")
+    y_rv = at.exp(base_rv * b)
+    y_rv.name = "y_rv"
+
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y}, sum=False)
+    logp_fn = aesara.function([b, y], logp)
+
+    b_val = 1.5
+    y_val = [0.1, 0.1]
+
+    np.testing.assert_allclose(
+        logp_fn(b_val, y_val),
+        sp.stats.lognorm(b_val).logpdf(y_val),
+    )
+
+
+def test_affine_log_transform():
+    a, b = at.scalars("a", "b")
+    base_rv = at.random.lognormal(0, 1, name="base_rv", size=(1, 2))
+    y_rv = a + at.log(base_rv) * b
+    y_rv.name = "y_rv"
+
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y}, sum=False)
+    logp_fn = aesara.function([a, b, y], logp)
+
+    a_val = -1.5
+    b_val = 3.0
+    y_val = [[0.1, 0.1]]
+
+    assert np.allclose(
+        logp_fn(a_val, b_val, y_val),
+        sp.stats.norm(a_val, b_val).logpdf(y_val),
+    )
+
+
+def test_hierarchical_derived_model():
+    scale_rv1 = at.random.halfnormal(0, 1, name="scale_rv1")
+    derived_rv1 = at.random.normal(0, 1, name="base_rv1") * scale_rv1
+    derived_rv1.name = "derived_rv1"
+
+    scale_rv2 = at.random.exponential(1, name="scale_rv2")
+    derived_rv2 = derived_rv1 + at.random.normal(0, 1, name="base_rv2") * scale_rv2
+    derived_rv2.name = "derived_rv2"
+
+    y_rv = at.random.normal(derived_rv2, 1, name="y_rv")
+
+    scale1 = scale_rv1.clone()
+    scale1.name = "scale1"
+    derived1 = derived_rv1.clone()
+    derived1.name = "derived1"
+
+    scale2 = scale_rv2.clone()
+    scale2.name = "scale2"
+    derived2 = derived_rv2.clone()
+    derived2.name = "derived2"
+
+    y = y_rv.clone()
+    y.name = "y"
+
+    logp = joint_logprob(
+        {
+            scale_rv1: scale1,
+            derived_rv1: derived1,
+            scale_rv2: scale2,
+            derived_rv2: derived2,
+            y_rv: y,
+        },
+    )
+    assert_no_rvs(logp)
+
+    scale1_val = 0.5
+    derived1_val = -1.0
+    scale2_val = 2.0
+    derived2_val = 3.0
+    y_val = 1.0
+
+    expected_logp = (
+        sp.stats.halfnorm(0, 1).logpdf(scale1_val)
+        + sp.stats.norm(0, scale1_val).logpdf(derived1_val)
+        + sp.stats.expon(scale=1).logpdf(scale2_val)
+        + sp.stats.norm(derived1_val, scale2_val).logpdf(derived2_val)
+        + sp.stats.norm(derived2_val, 1).logpdf(y_val)
+    )
+
+    aeppl_logp = logp.eval(
+        {
+            scale1: scale1_val,
+            derived1: derived1_val,
+            scale2: scale2_val,
+            derived2: derived2_val,
+            y: y_val,
+        }
+    )
+
+    assert np.isclose(expected_logp, aeppl_logp)
+
+
+def test_transformed_rv_and_value():
+    y_rv = at.random.halfnormal(-1, 1, name="base_rv") + 1
+    y = y_rv.type()
+    y.name = "y"
+
+    transform_opt = TransformValuesOpt({y: LogTransform()})
+
+    logp = joint_logprob({y_rv: y}, extra_rewrites=transform_opt)
+    assert_no_rvs(logp)
+    logp_fn = aesara.function([y], logp)
+
+    y_test_val = -5
+
+    assert np.isclose(
+        logp_fn(y_test_val),
+        sp.stats.halfnorm(0, 1).logpdf(np.exp(y_test_val)) + y_test_val,
+    )
+
+
+def test_multiple_base_rvs_fails():
+    x_rv1 = at.random.normal(name="x_rv1")
+    x_rv2 = at.random.normal(name="x_rv2")
+    y_rv = x_rv1 + x_rv2
+
+    y = y_rv.clone()
+
+    with pytest.raises(NotImplementedError):
+        joint_logprob({y_rv: y})
+
+
+def test_ignore_logprob_respected():
+    x_rv1 = at.random.normal(name="x_rv1")
+    x_rv2 = at.random.normal(name="x_rv2")
+    y_rv = x_rv1 + x_rv2
+
+    x_rv1.tag.ignore_logprob = True
+    y = y_rv.clone()
+
+    assert joint_logprob({y_rv: y}) is not None
+
+
+def test_discrete_rv_transform_fails():
+    loc = at.lscalar("loc")
+    y_rv = loc + at.random.poisson(1, name="base_rv")
+    y = y_rv.type()
+    y.name = "y"
+
+    # Cannot match Error message in rewrite phase
+    with pytest.raises(NotImplementedError):
+        joint_logprob({y_rv: y})
+
+
+def test_incompatible_size_fails():
+    loc = at.vector("loc")
+    y_rv = loc + at.random.normal(size=1, name="base_rv")
+    y = y_rv.type()
+    y.name = "y"
+
+    # Cannot match Error message in rewrite phase
+    with pytest.raises(NotImplementedError):
+        joint_logprob({y_rv: y})
+
+
+@pytest.mark.xfail(reason="Check not implemented yet, see #51")
+def test_invalid_broadcasted_transform_fails():
+    loc = at.vector("loc")
+    y_rv = loc + at.random.normal(0, 1, size=2, name="base_rv")
+    y = y_rv.type()
+    y.name = "y"
+
+    logp = joint_logprob({y_rv: y})
+    logp.eval({y: [0, 0, 0, 0], loc: [0, 0, 0, 0]})
+    assert False, "Should have failed before"
+
+
+def test_get_single_vars_between_in_out():
+    a, b, c, d, e, f = at.scalars("abcdef")
+    ab = a + b
+    cd = c + d
+    abcd = ab + cd
+    ef = e + f
+    x = abcd + ef
+    fgraph = FunctionGraph(outputs=[x], clone=False)
+
+    assert tuple(_get_single_vars_between_in_out(a, x, fgraph)) == (a, ab, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(b, x, fgraph)) == (b, ab, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(c, x, fgraph)) == (c, cd, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(d, x, fgraph)) == (d, cd, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(e, x, fgraph)) == (e, ef, x)
+    assert tuple(_get_single_vars_between_in_out(f, x, fgraph)) == (f, ef, x)
+    assert tuple(_get_single_vars_between_in_out(ab, x, fgraph)) == (ab, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(cd, x, fgraph)) == (cd, abcd, x)
+    assert tuple(_get_single_vars_between_in_out(ef, x, fgraph)) == (ef, x)
+    assert tuple(_get_single_vars_between_in_out(abcd, x, fgraph)) == (abcd, x)
+    assert tuple(_get_single_vars_between_in_out(x, x, fgraph)) == (x,)  # Edge case
+
+    # Graph with two branches from a -> y
+    a, b, c = at.scalars("abc")
+    ab = a + b
+    ac = a + c
+    x = ab + ac
+    fgraph = FunctionGraph(outputs=[x], clone=False)
+
+    assert not _get_single_vars_between_in_out(a, x, fgraph)
+    assert tuple(_get_single_vars_between_in_out(b, x, fgraph)) == (b, ab, x)
+    assert tuple(_get_single_vars_between_in_out(c, x, fgraph)) == (c, ac, x)
+
+    # Graph where input is not related to requseted output
+    a, b = at.scalars("ab")
+    y1 = a + 1.0
+    y2 = b + 1.0
+    fgraph = FunctionGraph(outputs=[y1, y2], clone=False)
+
+    assert tuple(_get_single_vars_between_in_out(a, y1, fgraph)) == (a, y1)
+    assert not _get_single_vars_between_in_out(a, y2, fgraph)
+    assert not _get_single_vars_between_in_out(b, y1, fgraph)
+    assert tuple(_get_single_vars_between_in_out(b, y2, fgraph)) == (b, y2)
