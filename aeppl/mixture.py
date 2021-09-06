@@ -160,7 +160,7 @@ def mixture_replace(fgraph, node):
 
 
 @_logprob.register(MixtureRV)
-def logprob_MixtureRV(op, values, *inputs, name=None, **kwargs):
+def logprob_MixtureRV(op, values, *inputs, **kwargs):
     (value,) = values
     inputs = op.get_non_shared_inputs(inputs)
 
